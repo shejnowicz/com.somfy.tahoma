@@ -2,6 +2,13 @@
 
 'use strict';
 
+// Fork (shejnowicz) fixes 2026-09-26: a tilt command no longer cancels an in-flight
+// position command (it waits for it), and the real state is re-read from TaHoma
+// after a command ends or is cancelled, so an optimistic capability value cannot
+// outlive a command that never physically happened.
+const POSITION_WAIT_SECONDS = 45;
+const RESYNC_DELAY_MS = 1500;
+
 const Device = require('./Device');
 
 /**
@@ -211,6 +218,7 @@ class WindowCoveringsDevice extends Device
 					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
 					this.executionCmd = '';
 					this.executionId = null;
+					this.scheduleResync();
 				}
 
 				if (this.executionCmd !== null)
@@ -227,6 +235,7 @@ class WindowCoveringsDevice extends Device
 						await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
 						this.executionCmd = '';
 						this.executionId = null;
+						this.scheduleResync();
 					}
 				}
 				this.executionCmd = this.windowcoveringsActions[value];
@@ -312,6 +321,7 @@ class WindowCoveringsDevice extends Device
 						await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
 						this.executionCmd = '';
 						this.executionId = null;
+						this.scheduleResync();
 					}
 				}
 				this.executionCmd = `${this.setPositionActionName}, ${value}`;
@@ -365,9 +375,26 @@ class WindowCoveringsDevice extends Device
 			{
 				if (this.executionId !== null)
 				{
-					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
-					this.executionCmd = '';
-					this.executionId = null;
+					if (String(this.executionCmd).startsWith(this.setPositionActionName))
+					{
+						// A position command is still in flight: let it finish. Cancelling it
+						// sends Stop and strands the blind at its current position.
+						try
+						{
+							await this.waitForActionToFinish(POSITION_WAIT_SECONDS);
+						}
+						catch (waitErr)
+						{
+							this.homey.app.logInformation(`${deviceData.label}: onCapabilityWindowcoveringsTiltSet`, `waiting for position command: ${waitErr.message}`);
+						}
+					}
+					if (this.executionId !== null)
+					{
+						await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
+						this.executionCmd = '';
+						this.executionId = null;
+						this.scheduleResync();
+					}
 				}
 
 				const action = {
@@ -412,6 +439,7 @@ class WindowCoveringsDevice extends Device
 					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
 					this.executionCmd = '';
 					this.executionId = null;
+					this.scheduleResync();
 				}
 
 				const action = {
@@ -445,6 +473,7 @@ class WindowCoveringsDevice extends Device
 					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
 					this.executionCmd = '';
 					this.executionId = null;
+					this.scheduleResync();
 				}
 
 				const action = {
@@ -1013,7 +1042,7 @@ class WindowCoveringsDevice extends Device
 				}
 				else if (element.name === 'ExecutionStateChangedEvent')
 				{
-					if ((element.newState === 'COMPLETED') || (element.newState === 'FAILED'))
+					if ((element.newState === 'COMPLETED') || (element.newState === 'FAILED') || (element.newState === 'CANCELLED'))
 					{
 						if (this.executionId && (this.executionId.id === element.execId))
 						{
@@ -1036,6 +1065,10 @@ class WindowCoveringsDevice extends Device
 							this.lastCommandFailed = (element.newState === 'FAILED');
 							this.lastFailureType = this.lastCommandFailed ? String(element.failureType || '') : '';
 
+							// A cancelled or failed command produces no DeviceStateChangedEvent, so the
+							// optimistic capability value must be corrected from the real state.
+							this.scheduleResync();
+
 							if (this.lastFailureType.toUpperCase() === 'ACTUATORNOANSWER')
 							{
 								this.setWarning('Actuator did not answer').catch(this.error);
@@ -1053,6 +1086,19 @@ class WindowCoveringsDevice extends Device
 				stack: error.stack,
 			});
 		}
+	}
+
+	scheduleResync()
+	{
+		if (this.resyncTimer)
+		{
+			this.homey.clearTimeout(this.resyncTimer);
+		}
+		this.resyncTimer = this.homey.setTimeout(() =>
+		{
+			this.resyncTimer = null;
+			this.sync().catch(this.error);
+		}, RESYNC_DELAY_MS);
 	}
 
 	async waitForActionToFinish(timeout)

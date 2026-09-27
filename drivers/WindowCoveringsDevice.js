@@ -6,10 +6,33 @@
 // position command (it waits for it), and the real state is re-read from TaHoma
 // after a command ends or is cancelled, so an optimistic capability value cannot
 // outlive a command that never physically happened.
+// Fork fixes 2026-09-27: a position/tilt/open/close command that TaHoma fails with
+// "Actuator did not answer" (the io-homecontrol frame was lost, nothing moved) is
+// re-issued up to MAX_COMMAND_RETRIES times after RETRY_DELAY_MS; when it finally
+// fails the optimistic capability value is reverted to the value captured before the
+// command, so a flow reading the capability sees the discrepancy, and the device
+// trigger "windowcoverings_command_failed" fires.
 const POSITION_WAIT_SECONDS = 45;
 const RESYNC_DELAY_MS = 1500;
+const RETRY_DELAY_MS = 20000;
+const MAX_COMMAND_RETRIES = 2;
 
 const Device = require('./Device');
+
+/**
+ * Retry decision for a failed command. Only TaHoma's "actuator did not answer" is
+ * worth retrying: the frame was lost and the motor did nothing. It arrives either as
+ * the execution failure type (ACTUATORNOANSWER) or as the API error text mapped by
+ * app.js ("Actuator did not answer"). Obstacle / wind protection, cancellation and
+ * every other failure are final.
+ * @param {string} reason failure type or error message
+ * @returns {boolean}
+ */
+function shouldRetryFailure(reason)
+{
+	const text = String(reason || '');
+	return (text.toLowerCase().indexOf('did not answer') >= 0) || (text.toUpperCase().indexOf('NOANSWER') >= 0);
+}
 
 /**
  * Base class for window coverings devices
@@ -91,6 +114,12 @@ class WindowCoveringsDevice extends Device
 		this.lastDispatchedAt = 0;
 		this.lastFailureType = '';
 		this.lastPedestrianState = null;
+
+		// Command issued by this driver that is still in flight, retry-pending or
+		// awaiting its terminal execution event (see startTrackedCommand).
+		this.commandSeq = 0;
+		this.pendingCommand = null;
+		this.retryTimer = null;
 
 		this.quietMode = false;
 
@@ -245,16 +274,16 @@ class WindowCoveringsDevice extends Device
 					parameters: [],
 				};
 
-				const result = await this.homey.app.executeDeviceAction(deviceData.label, deviceData.deviceURL, action, this.boostSync);
-				this.executionId = { id: result.execId, local: result.local };
-
-				this.setWarning(null).catch(this.error);
+				await this.startTrackedCommand('onCapabilityWindowcoveringsState', action, 'windowcoverings_state');
 			}
 			catch (err)
 			{
 				this.executionCmd = '';
 				this.setWarning(err.message).catch(this.error);
 				this.logCapabilityCommandError('onCapabilityWindowcoveringsState', err);
+				// Rejecting keeps Homey from storing the optimistic value for a command
+				// the hub never accepted.
+				throw err;
 			}
 			finally
 			{
@@ -341,16 +370,16 @@ class WindowCoveringsDevice extends Device
 					action.parameters.push('lowspeed');
 				}
 
-				const result = await this.homey.app.executeDeviceAction(deviceData.label, deviceData.deviceURL, action, this.boostSync);
-				this.executionId = { id: result.execId, local: result.local };
-
-				this.setWarning(null).catch(this.error);
+				await this.startTrackedCommand('onCapabilityWindowcoveringsSet', action, 'windowcoverings_set');
 			}
 			catch (err)
 			{
 				this.executionCmd = '';
 				this.setWarning(err.message).catch(this.error);
 				this.logCapabilityCommandError('onCapabilityWindowcoveringsSet', err);
+				// Rejecting keeps Homey from storing the optimistic value for a command
+				// the hub never accepted.
+				throw err;
 			}
 		}
 		else
@@ -373,15 +402,16 @@ class WindowCoveringsDevice extends Device
 			const deviceData = this.getData();
 			try
 			{
-				if (this.executionId !== null)
+				if (this.isCommandBusy())
 				{
 					if (String(this.executionCmd).startsWith(this.setPositionActionName))
 					{
 						// A position command is still in flight: let it finish. Cancelling it
-						// sends Stop and strands the blind at its current position.
+						// sends Stop and strands the blind at its current position. The wait
+						// covers the retry budget so a retried position move is not cut short.
 						try
 						{
-							await this.waitForActionToFinish(POSITION_WAIT_SECONDS);
+							await this.waitForActionToFinish(POSITION_WAIT_SECONDS + ((MAX_COMMAND_RETRIES * RETRY_DELAY_MS) / 1000));
 						}
 						catch (waitErr)
 						{
@@ -402,17 +432,17 @@ class WindowCoveringsDevice extends Device
 					parameters: [Math.round((1 - value) * 100)],
 				};
 
-				const result = await this.homey.app.executeDeviceAction(deviceData.label, deviceData.deviceURL, action, this.boostSync);
 				this.executionCmd = action.name;
-				this.executionId = { id: result.execId, local: result.local };
-
-				this.setWarning(null).catch(this.error);
+				await this.startTrackedCommand('onCapabilityWindowcoveringsTiltSet', action, 'windowcoverings_tilt_set');
 			}
 			catch (err)
 			{
 				this.executionCmd = '';
 				this.setWarning(err.message).catch(this.error);
 				this.logCapabilityCommandError('onCapabilityWindowcoveringsTiltSet', err);
+				// Rejecting keeps Homey from storing the optimistic value for a command
+				// the hub never accepted.
+				throw err;
 			}
 		}
 		else if (this.hasCapability('windowcoverings_tilt_set'))
@@ -1058,16 +1088,39 @@ class WindowCoveringsDevice extends Device
 								this.setCapabilityValue('windowcoverings_state', null).catch(this.error);
 							}
 
+							const failed = (element.newState === 'FAILED');
+							const failureType = failed ? this.getExecutionFailureType(element) : '';
+							const command = this.pendingCommand;
+							const isTrackedCommand = (command !== null) && (command.execId === element.execId);
+							this.executionId = null;
+
+							if (isTrackedCommand && failed && this.canRetryCommand(command, failureType))
+							{
+								// The actuator did not answer, so nothing moved: re-issue the same
+								// command. executionCmd and pendingCommand stay set, which keeps the
+								// device busy for the wait card and the tilt handler meanwhile.
+								this.scheduleCommandRetry(command, failureType);
+								continue;
+							}
+
 							this.homey.app.triggerCommandComplete(this, this.executionCmd, (element.newState === 'COMPLETED'));
 							this.driver.triggerDeviceCommandComplete(this, this.executionCmd, (element.newState === 'COMPLETED'));
-							this.executionId = null;
 							this.executionCmd = '';
-							this.lastCommandFailed = (element.newState === 'FAILED');
-							this.lastFailureType = this.lastCommandFailed ? String(element.failureType || '') : '';
+							this.lastCommandFailed = failed;
+							this.lastFailureType = failureType;
 
 							// A cancelled or failed command produces no DeviceStateChangedEvent, so the
 							// optimistic capability value must be corrected from the real state.
 							this.scheduleResync();
+
+							if (isTrackedCommand)
+							{
+								this.pendingCommand = null;
+								if (failed)
+								{
+									this.reportCommandFailure(command, failureType);
+								}
+							}
 
 							if (this.lastFailureType.toUpperCase() === 'ACTUATORNOANSWER')
 							{
@@ -1104,14 +1157,14 @@ class WindowCoveringsDevice extends Device
 	async waitForActionToFinish(timeout)
 	{
 		let retries = timeout;
-		while ((this.executionId !== null) && (retries-- > 0))
+		while (this.isCommandBusy() && (retries-- > 0))
 		{
 			await this.homey.app.asyncDelay(1000);
 		}
 
 		if (this.lastCommandFailed)
 		{
-			if (this.lastFailureType && this.lastFailureType.toUpperCase() === 'ACTUATORNOANSWER')
+			if (this.lastFailureType && shouldRetryFailure(this.lastFailureType))
 			{
 				throw new Error('Actuator did not answer');
 			}
@@ -1125,6 +1178,214 @@ class WindowCoveringsDevice extends Device
 		}
 	}
 
+	/**
+	 * True while a command issued by this driver has not reached a terminal outcome:
+	 * request in flight, execution running (executionId known) or a retry pending.
+	 * Executions started elsewhere (TaHoma app, scenarios) count through executionId.
+	 */
+	isCommandBusy()
+	{
+		return (this.executionId !== null) || (this.pendingCommand !== null);
+	}
+
+	/**
+	 * Issue a command this driver owns (position, tilt, open/close/stop) and track it
+	 * so a "did not answer" failure can be retried and a final failure reported
+	 * honestly. Resolves once the hub accepted the command or a retry is pending;
+	 * rejects only when the command is finally lost. The capability value is
+	 * captured here, before Homey stores the optimistic target, so it can be put
+	 * back on final failure.
+	 * @param {string} context handler name, used in the log
+	 * @param {{name: string, parameters: Array}} action TaHoma command
+	 * @param {string|null} capability capability whose optimistic value the command backs
+	 */
+	async startTrackedCommand(context, action, capability)
+	{
+		this.cancelPendingRetry();
+		this.commandSeq += 1;
+		this.lastCommandFailed = false;
+		this.lastFailureType = '';
+
+		const command = {
+			seq: this.commandSeq,
+			context,
+			action,
+			executionCmd: this.executionCmd,
+			capability: (capability && this.hasCapability(capability)) ? capability : null,
+			previousValue: null,
+			attempts: 0,
+			execId: null,
+		};
+		if (command.capability)
+		{
+			command.previousValue = this.getCapabilityValue(command.capability);
+		}
+
+		this.pendingCommand = command;
+		await this.launchCommand(command);
+	}
+
+	async launchCommand(command)
+	{
+		const deviceData = this.getData();
+		command.attempts += 1;
+		this.executionCmd = command.executionCmd;
+
+		let result;
+		try
+		{
+			result = await this.homey.app.executeDeviceAction(deviceData.label, deviceData.deviceURL, command.action, this.boostSync);
+		}
+		catch (err)
+		{
+			if (this.pendingCommand !== command)
+			{
+				// Superseded by a newer command while the request was in flight.
+				return;
+			}
+
+			const reason = (err && err.message) ? err.message : String(err);
+			if (this.canRetryCommand(command, reason))
+			{
+				this.scheduleCommandRetry(command, reason);
+				return;
+			}
+
+			this.executionCmd = '';
+			this.lastCommandFailed = true;
+			this.lastFailureType = reason;
+			this.pendingCommand = null;
+			this.reportCommandFailure(command, reason);
+			throw err;
+		}
+
+		if (this.pendingCommand !== command)
+		{
+			// Superseded by a newer command while the request was in flight; the newer
+			// command owns the execution bookkeeping now.
+			this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `execution ${result.execId} superseded by a newer command`);
+			return;
+		}
+
+		command.execId = result.execId;
+		this.executionId = { id: result.execId, local: result.local };
+
+		this.setWarning(null).catch(this.error);
+	}
+
+	canRetryCommand(command, reason)
+	{
+		// A lost Stop is not re-sent 20 s later: by then it would stop whatever the
+		// blind is doing for someone else.
+		return (command.action.name !== 'stop') && (command.attempts <= MAX_COMMAND_RETRIES) && shouldRetryFailure(reason);
+	}
+
+	scheduleCommandRetry(command, reason)
+	{
+		const deviceData = this.getData();
+		this.cancelPendingRetry();
+		this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `retry ${command.attempts}/${MAX_COMMAND_RETRIES} in ${RETRY_DELAY_MS / 1000} s after: ${this.describeFailure(reason)}`);
+		this.retryTimer = this.homey.setTimeout(() =>
+		{
+			this.retryTimer = null;
+			if (this.pendingCommand !== command)
+			{
+				// A newer command for this device replaced it meanwhile.
+				return;
+			}
+
+			this.launchCommand(command).catch((err) =>
+			{
+				this.logCapabilityCommandError(command.context, err);
+			});
+		}, RETRY_DELAY_MS);
+	}
+
+	cancelPendingRetry()
+	{
+		if (this.retryTimer)
+		{
+			this.homey.clearTimeout(this.retryTimer);
+			this.retryTimer = null;
+		}
+	}
+
+	getExecutionFailureType(element)
+	{
+		if (element.failureType)
+		{
+			return String(element.failureType);
+		}
+
+		if (Array.isArray(element.failedCommands) && element.failedCommands[0] && element.failedCommands[0].failureType)
+		{
+			return String(element.failedCommands[0].failureType);
+		}
+
+		return '';
+	}
+
+	describeFailure(reason)
+	{
+		if (shouldRetryFailure(reason))
+		{
+			return 'Actuator did not answer';
+		}
+
+		return reason ? String(reason) : 'Command failed';
+	}
+
+	/**
+	 * Final failure of a tracked command: put the capability back to the value it had
+	 * before the command (Homey stored the target optimistically when the listener
+	 * resolved), let the real state override it if TaHoma reports one, and fire the
+	 * "Command failed" device trigger.
+	 */
+	reportCommandFailure(command, reason)
+	{
+		const deviceData = this.getData();
+		const description = this.describeFailure(reason);
+		this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `failed after ${command.attempts} attempt(s): ${description}`);
+
+		if (command.capability)
+		{
+			this.setCapabilityValue(command.capability, command.previousValue).catch(this.error);
+		}
+		this.scheduleResync();
+
+		const tokens = {
+			command: command.action.name,
+			reason: description,
+			attempts: command.attempts,
+		};
+		try
+		{
+			this.homey.flow.getDeviceTriggerCard('windowcoverings_command_failed')
+				.trigger(this, tokens)
+				.catch((err) =>
+				{
+					this.logCapabilityCommandError('windowcoverings_command_failed', err);
+				});
+		}
+		catch (err)
+		{
+			this.logCapabilityCommandError('windowcoverings_command_failed', err);
+		}
+	}
+
+	onDeleted()
+	{
+		this.cancelPendingRetry();
+		if (this.resyncTimer)
+		{
+			this.homey.clearTimeout(this.resyncTimer);
+			this.resyncTimer = null;
+		}
+		return super.onDeleted();
+	}
+
 }
+
+WindowCoveringsDevice.shouldRetryFailure = shouldRetryFailure;
 
 module.exports = WindowCoveringsDevice;

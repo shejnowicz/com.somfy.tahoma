@@ -613,6 +613,93 @@
         ]
       },
       {
+        "id": "windowcoverings_command_failed",
+        "title": {
+          "en": "A command failed",
+          "nl": "Een opdracht is mislukt",
+          "da": "En kommando mislykkedes",
+          "de": "Ein Befehl ist fehlgeschlagen",
+          "es": "Un comando falló",
+          "fr": "Une commande a échoué",
+          "it": "Un comando non è riuscito",
+          "no": "En kommando mislyktes",
+          "sv": "Ett kommando misslyckades",
+          "pl": "Komenda nie powiodła się",
+          "ru": "Команда не выполнена",
+          "ko": "명령이 실패했습니다"
+        },
+        "hint": {
+          "en": "A position, tilt, open or close command sent by Homey was finally rejected by the hub, after the automatic retries of \"Actuator did not answer\". The capability value has been put back to the value from before the command.",
+          "pl": "Komenda pozycji, nachylenia, otwarcia lub zamknięcia wysłana przez Homey została ostatecznie odrzucona przez centralę, po automatycznych ponowieniach \"Actuator did not answer\". Wartość możliwości została przywrócona do stanu sprzed komendy."
+        },
+        "tokens": [
+          {
+            "name": "command",
+            "type": "string",
+            "title": {
+              "en": "Command Name",
+              "nl": "Opdrachtnaam",
+              "da": "Kommando Navn",
+              "de": "Befehlsname",
+              "es": "Nombre del Comando",
+              "fr": "Nom de la Commande",
+              "it": "Nome del Comando",
+              "no": "Kommandonavn",
+              "sv": "Kommando Namn",
+              "pl": "Nazwa polecenia",
+              "ru": "Имя команды",
+              "ko": "명령 이름"
+            },
+            "example": "setClosure"
+          },
+          {
+            "name": "reason",
+            "type": "string",
+            "title": {
+              "en": "Reason",
+              "nl": "Reden",
+              "da": "Årsag",
+              "de": "Grund",
+              "es": "Motivo",
+              "fr": "Raison",
+              "it": "Motivo",
+              "no": "Årsak",
+              "sv": "Orsak",
+              "pl": "Powód",
+              "ru": "Причина",
+              "ko": "이유"
+            },
+            "example": "Actuator did not answer"
+          },
+          {
+            "name": "attempts",
+            "type": "number",
+            "title": {
+              "en": "Attempts",
+              "nl": "Pogingen",
+              "da": "Forsøg",
+              "de": "Versuche",
+              "es": "Intentos",
+              "fr": "Tentatives",
+              "it": "Tentativi",
+              "no": "Forsøk",
+              "sv": "Försök",
+              "pl": "Próby",
+              "ru": "Попытки",
+              "ko": "시도 횟수"
+            },
+            "example": 3
+          }
+        ],
+        "args": [
+          {
+            "name": "device",
+            "type": "device",
+            "filter": "driver_id=io_exterior_venetian_blind|io_garage_door|io_garage_door_partial|io_horizontal_awning|io_pergola|io_roller_shutter|io_roller_shutter_quiet|io_sliding_gate|io_velux_interior_blind|io_velux_roller_shutter|io_velux_roof_window|io_vertical_exterior_blind|io_vertical_interior_blind|rts_gate_opener|rts_horizontal_awning|rts_interior_blind|rts_interior_curtain|rts_interior_venetian_blind"
+          }
+        ]
+      },
+      {
         "id": "windowcoverings_tilt_changed",
         "title": {
           "en": "The tilt changed",

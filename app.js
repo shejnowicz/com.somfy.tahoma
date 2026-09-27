@@ -260,7 +260,7 @@ class myApp extends Homey.App
 		this._conditionIsMoving.registerRunListener((args) =>
 		{
 			const { device } = args;
-			const conditionMet = (device.executionId !== null);
+			const conditionMet = (typeof device.isCommandBusy === 'function') ? device.isCommandBusy() : (device.executionId !== null);
 			return Promise.resolve(conditionMet);
 		});
 

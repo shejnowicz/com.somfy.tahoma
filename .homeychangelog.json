@@ -990,6 +990,6 @@
 		"en": "Updated the app settings to support multiple Somfy accounts."
 	},
 	"4.0.153": {
-		"en": "Added support for zigbee:SomfyTiltOnlyInteriorBlindComponent and rts:LightRTSComponent."
+		"en": "Added support for zigbee:SomfyTiltOnlyInteriorBlindComponent and rts:LightRTSComponent.\nWindow coverings: a position, tilt, open or close command that TaHoma fails with \"Actuator did not answer\" is retried automatically (up to 2 extra attempts, 20 s apart). When a command finally fails, the optimistic position / tilt / state value is reverted so flows see the real discrepancy, and the new device trigger \"A command failed\" fires (tokens: command, reason, attempts). The \"Wait for actions to finish\" card accepts up to 180 s. The position, tilt, open and close cards now reject when the hub refuses a command."
 	}
 }

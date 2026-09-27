@@ -35,7 +35,7 @@
 				"pl": "Maksymalny czas oczekiwania"
 			},
 			"min": 0,
-			"max": 60,
+			"max": 180,
 			"label": "seconds",
 			"placeholder": {
 				"en": "Timeout",

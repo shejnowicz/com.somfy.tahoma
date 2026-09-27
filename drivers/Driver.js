@@ -36,12 +36,21 @@ class Driver extends Homey.Driver
 	{
 		/** * Command Complete ** */
 		this._triggerCommandComplete = this.homey.flow.getDeviceTriggerCard('device_command_complete');
+
+		/** * Command Failed (window coverings) ** */
+		this._triggerCommandFailed = this.homey.flow.getDeviceTriggerCard('windowcoverings_command_failed');
 	}
 
 	triggerDeviceCommandComplete(device, commandName, success)
 	{
 		const tokens = { state: success, name: commandName };
 		this.triggerFlow(this._triggerCommandComplete, device, tokens);
+		return this;
+	}
+
+	triggerDeviceCommandFailed(device, tokens)
+	{
+		this.triggerFlow(this._triggerCommandFailed, device, tokens);
 		return this;
 	}
 

@@ -11,11 +11,13 @@
 // re-issued up to MAX_COMMAND_RETRIES times after RETRY_DELAY_MS; when it finally
 // fails the optimistic capability value is reverted to the value captured before the
 // command, so a flow reading the capability sees the discrepancy, and the device
-// trigger "windowcoverings_command_failed" fires.
+// trigger "windowcoverings_command_failed" fires. A tracked command whose terminal
+// execution event never arrives is released after COMMAND_WATCHDOG_MS.
 const POSITION_WAIT_SECONDS = 45;
 const RESYNC_DELAY_MS = 1500;
 const RETRY_DELAY_MS = 20000;
 const MAX_COMMAND_RETRIES = 2;
+const COMMAND_WATCHDOG_MS = 120000;
 
 const Device = require('./Device');
 
@@ -120,6 +122,7 @@ class WindowCoveringsDevice extends Device
 		this.commandSeq = 0;
 		this.pendingCommand = null;
 		this.retryTimer = null;
+		this.watchdogTimer = null;
 
 		this.quietMode = false;
 
@@ -274,7 +277,9 @@ class WindowCoveringsDevice extends Device
 					parameters: [],
 				};
 
-				await this.startTrackedCommand('onCapabilityWindowcoveringsState', action, 'windowcoverings_state');
+				// The tile toggle (windowcoverings_closed) routes through here, so both
+				// mirrors of the state are put back on final failure.
+				await this.startTrackedCommand('onCapabilityWindowcoveringsState', action, ['windowcoverings_state', 'windowcoverings_closed']);
 			}
 			catch (err)
 			{
@@ -370,7 +375,14 @@ class WindowCoveringsDevice extends Device
 					action.parameters.push('lowspeed');
 				}
 
-				await this.startTrackedCommand('onCapabilityWindowcoveringsSet', action, 'windowcoverings_set');
+				// A subclass may route an up/down state command here (quiet roller
+				// shutters); the optimistic value then lives on the state mirrors too.
+				const capabilities = ['windowcoverings_set'];
+				if (opts && opts.fromState)
+				{
+					capabilities.push('windowcoverings_state', 'windowcoverings_closed');
+				}
+				await this.startTrackedCommand('onCapabilityWindowcoveringsSet', action, capabilities);
 			}
 			catch (err)
 			{
@@ -404,6 +416,7 @@ class WindowCoveringsDevice extends Device
 			{
 				if (this.isCommandBusy())
 				{
+					let keepRunning = false;
 					if (String(this.executionCmd).startsWith(this.setPositionActionName))
 					{
 						// A position command is still in flight: let it finish. Cancelling it
@@ -417,8 +430,17 @@ class WindowCoveringsDevice extends Device
 						{
 							this.homey.app.logInformation(`${deviceData.label}: onCapabilityWindowcoveringsTiltSet`, `waiting for position command: ${waitErr.message}`);
 						}
+
+						// Still our own position command after the wait (running late or
+						// mid-retry): never stop it. The tilt is sent after it and only takes
+						// over the bookkeeping (a pending retry is dropped as superseded).
+						keepRunning = (this.pendingCommand !== null);
+						if (keepRunning)
+						{
+							this.homey.app.logInformation(`${deviceData.label}: onCapabilityWindowcoveringsTiltSet`, 'position command still in progress, sending tilt without cancelling it');
+						}
 					}
-					if (this.executionId !== null)
+					if ((this.executionId !== null) && !keepRunning)
 					{
 						await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
 						this.executionCmd = '';
@@ -464,6 +486,7 @@ class WindowCoveringsDevice extends Device
 			const deviceData = this.getData();
 			try
 			{
+				this.abandonTrackedCommand();
 				if (this.executionId !== null)
 				{
 					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
@@ -498,6 +521,7 @@ class WindowCoveringsDevice extends Device
 			const deviceData = this.getData();
 			try
 			{
+				this.abandonTrackedCommand();
 				if (this.executionId !== null)
 				{
 					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
@@ -532,6 +556,7 @@ class WindowCoveringsDevice extends Device
 			const deviceData = this.getData();
 			try
 			{
+				this.abandonTrackedCommand();
 				if (this.executionId !== null)
 				{
 					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
@@ -563,6 +588,7 @@ class WindowCoveringsDevice extends Device
 			const deviceData = this.getData();
 			try
 			{
+				this.abandonTrackedCommand();
 				if (this.executionId !== null)
 				{
 					await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);
@@ -1115,11 +1141,19 @@ class WindowCoveringsDevice extends Device
 
 							if (isTrackedCommand)
 							{
+								this.clearCommandWatchdog();
 								this.pendingCommand = null;
 								if (failed)
 								{
 									this.reportCommandFailure(command, failureType);
 								}
+							}
+							else if ((command !== null) && (command.execId !== null))
+							{
+								// The execution we were following was someone else's and our own
+								// terminal event never matched (missed or superseded): stop waiting
+								// for it; the resync above fetches the real state.
+								this.abandonTrackedCommand();
 							}
 
 							if (this.lastFailureType.toUpperCase() === 'ACTUATORNOANSWER')
@@ -1192,16 +1226,16 @@ class WindowCoveringsDevice extends Device
 	 * Issue a command this driver owns (position, tilt, open/close/stop) and track it
 	 * so a "did not answer" failure can be retried and a final failure reported
 	 * honestly. Resolves once the hub accepted the command or a retry is pending;
-	 * rejects only when the command is finally lost. The capability value is
-	 * captured here, before Homey stores the optimistic target, so it can be put
+	 * rejects only when the command is finally lost. The capability values are
+	 * captured here, before Homey stores the optimistic target, so they can be put
 	 * back on final failure.
 	 * @param {string} context handler name, used in the log
 	 * @param {{name: string, parameters: Array}} action TaHoma command
-	 * @param {string|null} capability capability whose optimistic value the command backs
+	 * @param {string|string[]} capabilities capabilities whose optimistic value the command backs
 	 */
-	async startTrackedCommand(context, action, capability)
+	async startTrackedCommand(context, action, capabilities)
 	{
-		this.cancelPendingRetry();
+		this.abandonTrackedCommand();
 		this.commandSeq += 1;
 		this.lastCommandFailed = false;
 		this.lastFailureType = '';
@@ -1211,14 +1245,17 @@ class WindowCoveringsDevice extends Device
 			context,
 			action,
 			executionCmd: this.executionCmd,
-			capability: (capability && this.hasCapability(capability)) ? capability : null,
-			previousValue: null,
+			reverts: [],
 			attempts: 0,
 			execId: null,
 		};
-		if (command.capability)
+		const names = Array.isArray(capabilities) ? capabilities : [capabilities];
+		for (const capability of names)
 		{
-			command.previousValue = this.getCapabilityValue(command.capability);
+			if (capability && this.hasCapability(capability))
+			{
+				command.reverts.push({ capability, previousValue: this.getCapabilityValue(capability) });
+			}
 		}
 
 		this.pendingCommand = command;
@@ -1261,14 +1298,17 @@ class WindowCoveringsDevice extends Device
 
 		if (this.pendingCommand !== command)
 		{
-			// Superseded by a newer command while the request was in flight; the newer
-			// command owns the execution bookkeeping now.
-			this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `execution ${result.execId} superseded by a newer command`);
+			// Superseded by a newer command while the request was in flight: the newer
+			// command owns the bookkeeping, so stop this execution rather than let two
+			// moves compete on the device.
+			this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `execution ${result.execId} superseded by a newer command, cancelling it`);
+			await this.homey.app.cancelExecution(deviceData.label, result.execId, result.local);
 			return;
 		}
 
 		command.execId = result.execId;
 		this.executionId = { id: result.execId, local: result.local };
+		this.armCommandWatchdog(command);
 
 		this.setWarning(null).catch(this.error);
 	}
@@ -1284,6 +1324,7 @@ class WindowCoveringsDevice extends Device
 	{
 		const deviceData = this.getData();
 		this.cancelPendingRetry();
+		this.clearCommandWatchdog();
 		this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `retry ${command.attempts}/${MAX_COMMAND_RETRIES} in ${RETRY_DELAY_MS / 1000} s after: ${this.describeFailure(reason)}`);
 		this.retryTimer = this.homey.setTimeout(() =>
 		{
@@ -1307,6 +1348,52 @@ class WindowCoveringsDevice extends Device
 		{
 			this.homey.clearTimeout(this.retryTimer);
 			this.retryTimer = null;
+		}
+	}
+
+	/**
+	 * Drop the tracked command without reporting it: a command outside the tracked
+	 * set (nudge, My, pedestrian, quiet mode) or a newer tracked command takes over
+	 * the device, so a pending retry must not fire over it and the old outcome is no
+	 * longer ours to report.
+	 */
+	abandonTrackedCommand()
+	{
+		this.cancelPendingRetry();
+		this.clearCommandWatchdog();
+		this.pendingCommand = null;
+	}
+
+	/**
+	 * Release a tracked command whose terminal execution event never arrives (missed
+	 * poll, hub restart), so the device does not stay busy until the next command.
+	 */
+	armCommandWatchdog(command)
+	{
+		this.clearCommandWatchdog();
+		this.watchdogTimer = this.homey.setTimeout(() =>
+		{
+			this.watchdogTimer = null;
+			if ((this.pendingCommand !== command) || (this.executionId === null) || (this.executionId.id !== command.execId))
+			{
+				return;
+			}
+
+			const deviceData = this.getData();
+			this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `no terminal event within ${COMMAND_WATCHDOG_MS / 1000} s for execution ${command.execId}, releasing it`);
+			this.executionId = null;
+			this.executionCmd = '';
+			this.pendingCommand = null;
+			this.scheduleResync();
+		}, COMMAND_WATCHDOG_MS);
+	}
+
+	clearCommandWatchdog()
+	{
+		if (this.watchdogTimer)
+		{
+			this.homey.clearTimeout(this.watchdogTimer);
+			this.watchdogTimer = null;
 		}
 	}
 
@@ -1347,9 +1434,9 @@ class WindowCoveringsDevice extends Device
 		const description = this.describeFailure(reason);
 		this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `failed after ${command.attempts} attempt(s): ${description}`);
 
-		if (command.capability)
+		for (const revert of command.reverts)
 		{
-			this.setCapabilityValue(command.capability, command.previousValue).catch(this.error);
+			this.setCapabilityValue(revert.capability, revert.previousValue).catch(this.error);
 		}
 		this.scheduleResync();
 
@@ -1360,12 +1447,7 @@ class WindowCoveringsDevice extends Device
 		};
 		try
 		{
-			this.homey.flow.getDeviceTriggerCard('windowcoverings_command_failed')
-				.trigger(this, tokens)
-				.catch((err) =>
-				{
-					this.logCapabilityCommandError('windowcoverings_command_failed', err);
-				});
+			this.driver.triggerDeviceCommandFailed(this, tokens);
 		}
 		catch (err)
 		{
@@ -1375,7 +1457,7 @@ class WindowCoveringsDevice extends Device
 
 	onDeleted()
 	{
-		this.cancelPendingRetry();
+		this.abandonTrackedCommand();
 		if (this.resyncTimer)
 		{
 			this.homey.clearTimeout(this.resyncTimer);

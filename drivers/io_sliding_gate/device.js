@@ -80,6 +80,7 @@ class SlidingGateDevice extends WindowCoveringsDevice
             const deviceData = this.getData();
             try
             {
+                this.abandonTrackedCommand();
                 if (this.executionId !== null)
                 {
                     await this.homey.app.cancelExecution(deviceData.label, this.executionId.id, this.executionId.local);

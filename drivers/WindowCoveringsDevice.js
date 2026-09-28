@@ -13,6 +13,9 @@
 // command, so a flow reading the capability sees the discrepancy, and the device
 // trigger "windowcoverings_command_failed" fires. A tracked command whose terminal
 // execution event never arrives is released after COMMAND_WATCHDOG_MS.
+// Fork fix 2026-09-28: a cancelled or superseded command (CMDCANCELLED) is not a
+// failure - it is only logged and resynced, without reverting the value the newer
+// command is driving to, without a device warning and without the failed trigger.
 const POSITION_WAIT_SECONDS = 45;
 const RESYNC_DELAY_MS = 1500;
 const RETRY_DELAY_MS = 20000;
@@ -34,6 +37,20 @@ function shouldRetryFailure(reason)
 {
 	const text = String(reason || '');
 	return (text.toLowerCase().indexOf('did not answer') >= 0) || (text.toUpperCase().indexOf('NOANSWER') >= 0);
+}
+
+/**
+ * A cancellation is not a failure. TaHoma answers CMDCANCELLED when a newer command
+ * takes an execution over (a flow sending "close" and then a position does exactly
+ * that on every blind), so the motor is fine and the newer command is already on its
+ * way. Such an outcome must not revert, warn or notify. It stays non-retryable.
+ * @param {string} reason failure type or error message
+ * @returns {boolean}
+ */
+function isCancellation(reason)
+{
+	const text = String(reason || '').toUpperCase();
+	return (text.indexOf('CANCELLED') >= 0) || (text.indexOf('CANCELED') >= 0);
 }
 
 /**
@@ -1289,9 +1306,18 @@ class WindowCoveringsDevice extends Device
 			}
 
 			this.executionCmd = '';
-			this.lastCommandFailed = true;
 			this.lastFailureType = reason;
 			this.pendingCommand = null;
+
+			if (isCancellation(reason))
+			{
+				// A newer command took this one over: rejecting here would make the caller
+				// set a device warning and Homey drop the value the newer command drives to.
+				this.reportCommandCancelled(command, reason);
+				return;
+			}
+
+			this.lastCommandFailed = true;
 			this.reportCommandFailure(command, reason);
 			throw err;
 		}
@@ -1430,6 +1456,12 @@ class WindowCoveringsDevice extends Device
 	 */
 	reportCommandFailure(command, reason)
 	{
+		if (isCancellation(reason))
+		{
+			this.reportCommandCancelled(command, reason);
+			return;
+		}
+
 		const deviceData = this.getData();
 		const description = this.describeFailure(reason);
 		this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `failed after ${command.attempts} attempt(s): ${description}`);
@@ -1455,6 +1487,21 @@ class WindowCoveringsDevice extends Device
 		}
 	}
 
+	/**
+	 * Terminal outcome of a tracked command that was cancelled or superseded by a
+	 * newer command. Nothing failed, so the captured values are NOT put back (they
+	 * belong to a command that is already running), no device warning is set and the
+	 * "Command failed" trigger stays silent; only the real state is re-read.
+	 */
+	reportCommandCancelled(command, reason)
+	{
+		const deviceData = this.getData();
+		const description = reason ? String(reason) : 'CMDCANCELLED';
+		this.homey.app.logInformation(`${deviceData.label}: ${command.context}`, `cancelled after ${command.attempts} attempt(s): ${description} - superseded by a newer command, not a failure`);
+		this.lastCommandFailed = false;
+		this.scheduleResync();
+	}
+
 	onDeleted()
 	{
 		this.abandonTrackedCommand();
@@ -1469,5 +1516,6 @@ class WindowCoveringsDevice extends Device
 }
 
 WindowCoveringsDevice.shouldRetryFailure = shouldRetryFailure;
+WindowCoveringsDevice.isCancellation = isCancellation;
 
 module.exports = WindowCoveringsDevice;
